@@ -36,6 +36,8 @@ The image includes a health check at `/api/health`. Configure `PORT` only if Coo
 
 The application intentionally does not store job-site passwords or submit applications without an explicit approval step.
 
+Deployment is connected to Coolify through the repository push webhook. Pushes to `master` trigger a new deployment automatically.
+
 ## AI providers
 
 Resume tailoring uses OpenAI when `OPENAI_API_KEY` is present, Gemini when `GEMINI_API_KEY` is present, and a local template when neither is configured. Set the model names with `OPENAI_MODEL` or `GEMINI_MODEL`. Keep keys in Coolify environment variables; never commit them.
