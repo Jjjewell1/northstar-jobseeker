@@ -2,6 +2,8 @@
 
 Northstar is an approval-first job-search assistant. It discovers current remote roles, imports PDF/DOCX/text resumes, extracts profile details, generates a truthful job-specific resume, and keeps every application behind an explicit approval step. It includes persistent local storage, twice-daily searches, manual runs, dark mode, onboarding, and a Docker image suitable for Coolify.
 
+The deployed single-user MVP includes real account creation, password-based sign-in, 30-day secure HTTP-only sessions, sign-out, session-protected APIs, and a guided three-step setup checklist. Passwords are stored as salted `scrypt` hashes, never as plain text.
+
 ## Run locally
 
 ```bash
@@ -16,6 +18,10 @@ Run the built-in validation with `npm test`.
 ## API
 
 - `GET /api/health`
+- `GET /api/auth/session`
+- `POST /api/auth/signup`
+- `POST /api/auth/signin`
+- `POST /api/auth/signout`
 - `GET /api/state`
 - `GET|PUT /api/profile`
 - `GET|POST /api/resumes`

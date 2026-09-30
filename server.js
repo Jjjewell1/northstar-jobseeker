@@ -13,13 +13,11 @@ const dataFile = path.join(dataDir, 'store.json');
 fs.mkdirSync(resumeDir, { recursive: true });
 
 const seed = {
-  profile: { name: 'Jordan Davis', title: 'Product Designer', email: '', phone: '', location: 'New York, NY', skills: ['Product strategy', 'UX research', 'Design systems'], summary: '', links: [] },
+  account: null,
+  sessions: [],
+  profile: { name: '', title: '', email: '', phone: '', location: '', skills: [], summary: '', links: [] },
   resumes: [],
-  jobs: [
-    { id: 1, company: 'Airbnb', initial: 'A', title: 'Senior Product Designer', place: 'Remote · United States', salary: '$145k – $182k', match: '96%', status: 'review' },
-    { id: 2, company: 'Notion', initial: 'N', title: 'Product Designer, Growth', place: 'New York, NY · Hybrid', salary: '$130k – $165k', match: '92%', status: 'review' },
-    { id: 3, company: 'Linear', initial: 'L', title: 'Product Designer, Core', place: 'Remote · North America', salary: '$140k – $175k', match: '89%', status: 'review' }
-  ],
+  jobs: [],
   applications: [], runs: [],
   integrations: [
     { id: 'greenhouse', name: 'Greenhouse', status: 'available' },
@@ -33,9 +31,11 @@ function read() {
   if (!fs.existsSync(dataFile)) fs.writeFileSync(dataFile, JSON.stringify(seed, null, 2));
   const data = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
   data.resumes ||= [];
+  data.sessions ||= [];
   data.profile ||= structuredClone(seed.profile);
   data.profile.links ||= [];
   data.profile.skills ||= [];
+  data.jobs = (data.jobs || []).filter(job => job.source || ![1, 2, 3].includes(job.id));
   return data;
 }
 const save = data => fs.writeFileSync(dataFile, JSON.stringify(data, null, 2));
@@ -46,6 +46,37 @@ const parse = (req, limit = 12 * 1024 * 1024) => new Promise((resolve, reject) =
   req.on('end', () => { try { resolve(text ? JSON.parse(text) : {}); } catch { reject(new Error('Invalid JSON')); } });
   req.on('error', reject);
 });
+
+const hashToken = token => crypto.createHash('sha256').update(token).digest('hex');
+const passwordHash = (password, salt = crypto.randomBytes(16).toString('hex')) => new Promise((resolve, reject) => crypto.scrypt(password, salt, 64, (error, key) => error ? reject(error) : resolve(`${salt}:${key.toString('hex')}`)));
+async function passwordMatches(password, stored = '') {
+  const [salt, expectedHex] = stored.split(':');
+  if (!salt || !expectedHex) return false;
+  const candidate = await passwordHash(password, salt);
+  const candidateHex = candidate.split(':')[1];
+  return candidateHex.length === expectedHex.length && crypto.timingSafeEqual(Buffer.from(candidateHex, 'hex'), Buffer.from(expectedHex, 'hex'));
+}
+function cookies(req) { return Object.fromEntries((req.headers.cookie || '').split(';').map(part => part.trim().split('=').map(decodeURIComponent)).filter(pair => pair.length === 2)); }
+function currentUser(req, data) {
+  const token = cookies(req).northstar_session;
+  if (!token || !data.account) return null;
+  const now = Date.now();
+  data.sessions = data.sessions.filter(session => new Date(session.expiresAt).getTime() > now);
+  return data.sessions.some(session => session.tokenHash === hashToken(token)) ? { name: data.account.name, email: data.account.email } : null;
+}
+function startSession(res, data) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  data.sessions.push({ tokenHash: hashToken(token), expiresAt });
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  res.setHeader('set-cookie', `northstar_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secure}`);
+}
+function endSession(req, res, data) {
+  const token = cookies(req).northstar_session;
+  if (token) data.sessions = data.sessions.filter(session => session.tokenHash !== hashToken(token));
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  res.setHeader('set-cookie', `northstar_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`);
+}
 
 function safeName(name = 'resume') { return path.basename(name).replace(/[^a-z0-9._-]+/gi, '-').slice(0, 100); }
 async function extractText(buffer, filename, mime = '') {
@@ -121,7 +152,25 @@ async function api(req, res, url) {
   const parts = url.pathname.split('/').filter(Boolean);
   try {
     if (url.pathname === '/api/health') return send(res, 200, { ok: true, resumes: data.resumes.length });
-    if (url.pathname === '/api/state') return send(res, 200, data);
+    if (url.pathname === '/api/auth/session' && req.method === 'GET') {
+      const user = currentUser(req, data); save(data); return send(res, 200, { authenticated: Boolean(user), user, canSignUp: !data.account });
+    }
+    if (url.pathname === '/api/auth/signup' && req.method === 'POST') {
+      if (data.account) return send(res, 409, { error: 'An account already exists. Sign in instead.' });
+      const input = await parse(req); const name = String(input.name || '').trim(); const email = String(input.email || '').trim().toLowerCase(); const password = String(input.password || '');
+      if (name.length < 2 || !/^\S+@\S+\.\S+$/.test(email) || password.length < 8) return send(res, 400, { error: 'Enter your name, a valid email, and a password of at least 8 characters.' });
+      data.account = { name, email, passwordHash: await passwordHash(password), createdAt: new Date().toISOString() };
+      data.profile = { name, email, title: '', phone: '', location: '', skills: [], summary: '', links: [] }; startSession(res, data); save(data); return send(res, 201, { user: { name, email }, onboarding: true });
+    }
+    if (url.pathname === '/api/auth/signin' && req.method === 'POST') {
+      const input = await parse(req); const email = String(input.email || '').trim().toLowerCase();
+      if (!data.account || email !== data.account.email || !await passwordMatches(String(input.password || ''), data.account.passwordHash)) return send(res, 401, { error: 'Email or password is incorrect.' });
+      startSession(res, data); save(data); return send(res, 200, { user: { name: data.account.name, email: data.account.email } });
+    }
+    if (url.pathname === '/api/auth/signout' && req.method === 'POST') { endSession(req, res, data); save(data); return send(res, 200, { ok: true }); }
+    const user = currentUser(req, data);
+    if (!user) { save(data); return send(res, 401, { error: 'Sign in required.' }); }
+    if (url.pathname === '/api/state') { const { account, sessions, ...safeData } = data; return send(res, 200, safeData); }
     if (url.pathname === '/api/profile' && req.method === 'GET') return send(res, 200, data.profile);
     if (url.pathname === '/api/profile' && req.method === 'PUT') { data.profile = { ...data.profile, ...await parse(req) }; save(data); return send(res, 200, data.profile); }
     if (url.pathname === '/api/ai/status' && req.method === 'GET') return send(res, 200, { configured: Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY), provider: 'gemini', model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
