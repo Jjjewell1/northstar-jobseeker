@@ -290,5 +290,5 @@ http.createServer((req, res) => {
   if (url.pathname.startsWith('/api/')) return api(req, res, url);
   const file = path.join(root, url.pathname === '/' ? 'index.html' : url.pathname);
   if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, { error: 'Not found' });
-  res.writeHead(200, { 'content-type': mime[path.extname(file)] || 'application/octet-stream' }); fs.createReadStream(file).pipe(res);
+  res.writeHead(200, { 'content-type': mime[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-cache, must-revalidate' }); fs.createReadStream(file).pipe(res);
 }).listen(process.env.PORT || 3000, () => console.log(`Northstar running on http://localhost:${process.env.PORT || 3000}`));
