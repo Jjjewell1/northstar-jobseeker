@@ -5,12 +5,16 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import pdfParse from 'pdf-parse';
 import mammoth from 'mammoth';
+import PDFDocument from 'pdfkit';
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType } from 'docx';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(root, 'data');
 const resumeDir = path.join(dataDir, 'resumes');
+const profileDir = path.join(dataDir, 'profile');
 const dataFile = path.join(dataDir, 'store.json');
 fs.mkdirSync(resumeDir, { recursive: true });
+fs.mkdirSync(profileDir, { recursive: true });
 
 const seed = {
   account: null,
@@ -79,6 +83,7 @@ function endSession(req, res, data) {
 }
 
 function safeName(name = 'resume') { return path.basename(name).replace(/[^a-z0-9._-]+/gi, '-').slice(0, 100); }
+function profileView(profile) { const { photoStoredName, ...safe } = profile; return { ...safe, hasPhoto: Boolean(photoStoredName), photoUrl: photoStoredName ? '/api/profile/photo' : '' }; }
 async function extractText(buffer, filename, mime = '') {
   const ext = path.extname(filename).toLowerCase();
   if (ext === '.pdf' || mime === 'application/pdf') return (await pdfParse(buffer)).text.trim();
@@ -93,23 +98,40 @@ function profileSuggestions(text) {
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   return { name: lines[0]?.length < 80 ? lines[0] : '', email, phone, links, summary: lines.slice(1, 5).join(' ').slice(0, 500) };
 }
-function templateResume(profile, job) {
-  return `${profile.name}\n${profile.title}\n${profile.location} · ${profile.email}${profile.phone ? ` · ${profile.phone}` : ''}\n\nTARGET ROLE\n${job.title} at ${job.company}\n\nSUMMARY\n${profile.summary || `${profile.title} with experience aligned to ${job.title}.`}\n\nCORE SKILLS\n${(profile.skills || []).join(' • ')}\n\nAPPLICATION NOTES\nTailored from confirmed Northstar profile data. Review before submitting.`;
+function templateResume(profile, job, sourceText = '') {
+  return `${profile.name}\n${profile.title || job.title}\n${[profile.location, profile.email, profile.phone].filter(Boolean).join(' · ')}\n\nPROFESSIONAL SUMMARY\n${profile.summary || `Candidate targeting ${job.title} opportunities at ${job.company}.`}\n\nCORE SKILLS\n${(profile.skills || []).join(' • ')}\n\nPROFESSIONAL EXPERIENCE\n${sourceText || 'Add a master resume to include verified experience.'}\n\nTARGET ROLE\n${job.title} at ${job.company}`;
 }
 async function generateResume(profile, job, sourceText = '') {
   const prompt = `Create a concise, truthful ATS-friendly resume draft. Never invent employers, dates, metrics, education, credentials, or skills. Use only the supplied candidate data and source resume. Return plain text with CONTACT, SUMMARY, CORE SKILLS, EXPERIENCE, EDUCATION, and APPLICATION NOTES. Candidate: ${JSON.stringify(profile)}. Source resume: ${sourceText.slice(0, 16000)}. Job: ${JSON.stringify(job)}.`;
   if (process.env.OPENAI_API_KEY) {
     const response = await fetch('https://api.openai.com/v1/responses', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-5-mini', input: prompt, store: false }) });
-    if (response.ok) { const result = await response.json(); return { text: result.output_text || templateResume(profile, job), provider: 'openai' }; }
+    if (response.ok) { const result = await response.json(); return { text: result.output_text || templateResume(profile, job, sourceText), provider: 'openai' }; }
   }
   const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (geminiKey) {
     const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) });
-    if (response.ok) { const result = await response.json(); return { text: result.candidates?.[0]?.content?.parts?.[0]?.text || templateResume(profile, job), provider: 'gemini' }; }
+    if (response.ok) { const result = await response.json(); return { text: result.candidates?.[0]?.content?.parts?.[0]?.text || templateResume(profile, job, sourceText), provider: 'gemini' }; }
   }
-  return { text: templateResume(profile, job), provider: 'template' };
+  return { text: templateResume(profile, job, sourceText), provider: 'template' };
 }
+
+function resumeSections(text = '') {
+  const headings = new Set(['CONTACT', 'PROFESSIONAL SUMMARY', 'SUMMARY', 'CORE SKILLS', 'SKILLS', 'PROFESSIONAL EXPERIENCE', 'EXPERIENCE', 'EDUCATION', 'CERTIFICATIONS', 'TARGET ROLE', 'APPLICATION NOTES']);
+  const sections = []; let current = { title: '', lines: [] };
+  for (const raw of text.split(/\r?\n/)) { const line = raw.trim(); if (!line) continue; if (headings.has(line.toUpperCase())) { if (current.lines.length) sections.push(current); current = { title: line.toUpperCase(), lines: [] }; } else current.lines.push(line); }
+  if (current.lines.length) sections.push(current); return sections;
+}
+async function atsDocx(application, profile) {
+  const sections = resumeSections(application.resume.text); const children = [];
+  const first = sections.shift(); const headerLines = first?.title ? [] : (first?.lines || []).slice(0, 3);
+  children.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 80 }, children: [new TextRun({ text: profile.name || headerLines[0] || '', bold: true, size: 34, font: 'Arial' })] }));
+  children.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 220 }, children: [new TextRun({ text: [profile.title || application.title, profile.location, profile.email, profile.phone].filter(Boolean).join(' | '), size: 20, font: 'Arial' })] }));
+  for (const section of sections) { if (section.title === 'TARGET ROLE' || section.title === 'APPLICATION NOTES') continue; children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 180, after: 80 }, children: [new TextRun({ text: section.title || 'PROFILE', bold: true, size: 23, font: 'Arial', color: '1D5F4A' })] })); for (const line of section.lines) children.push(new Paragraph({ spacing: { after: 70 }, children: [new TextRun({ text: line, size: 20, font: 'Arial' })] })); }
+  const doc = new Document({ styles: { default: { document: { run: { font: 'Arial', size: 20 } } } }, sections: [{ properties: { page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } } }, children }] });
+  return Packer.toBuffer(doc);
+}
+function visualPdf(application, profile, photoPath = '') { return new Promise((resolve, reject) => { const doc = new PDFDocument({ size: 'LETTER', margins: { top: 54, left: 54, right: 54, bottom: 54 }, info: { Title: `${profile.name} Resume`, Author: profile.name } }); const chunks = []; doc.on('data', chunk => chunks.push(chunk)); doc.on('end', () => resolve(Buffer.concat(chunks))); doc.on('error', reject); doc.rect(0, 0, 612, 116).fill('#173D33'); doc.fillColor('#FFFFFF').font('Helvetica-Bold').fontSize(24).text(profile.name || '', 54, 40, { width: photoPath ? 410 : 504 }); doc.font('Helvetica').fontSize(11).fillColor('#D8F06B').text(profile.title || application.title, 54, 74); doc.fontSize(9).fillColor('#EAF3ED').text([profile.location, profile.email, profile.phone].filter(Boolean).join('  •  '), 54, 94); if (photoPath && fs.existsSync(photoPath)) { try { doc.save().circle(548, 58, 36).clip().image(photoPath, 512, 22, { fit: [72, 72], align: 'center', valign: 'center' }).restore(); } catch {} } doc.y = 142; for (const section of resumeSections(application.resume.text)) { if (!section.title || section.title === 'TARGET ROLE' || section.title === 'APPLICATION NOTES') continue; if (doc.y > 680) doc.addPage(); doc.fillColor('#1D5F4A').font('Helvetica-Bold').fontSize(11).text(section.title, { characterSpacing: .7 }); doc.moveDown(.25); doc.fillColor('#26332E').font('Helvetica').fontSize(9.5); for (const line of section.lines) doc.text(line, { lineGap: 2 }); doc.moveDown(.7); } doc.end(); }); }
 
 async function assistWithGemini(field, value, profile) {
   const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
@@ -170,9 +192,17 @@ async function api(req, res, url) {
     if (url.pathname === '/api/auth/signout' && req.method === 'POST') { endSession(req, res, data); save(data); return send(res, 200, { ok: true }); }
     const user = currentUser(req, data);
     if (!user) { save(data); return send(res, 401, { error: 'Sign in required.' }); }
-    if (url.pathname === '/api/state') { const { account, sessions, ...safeData } = data; return send(res, 200, safeData); }
-    if (url.pathname === '/api/profile' && req.method === 'GET') return send(res, 200, data.profile);
-    if (url.pathname === '/api/profile' && req.method === 'PUT') { data.profile = { ...data.profile, ...await parse(req) }; save(data); return send(res, 200, data.profile); }
+    if (url.pathname === '/api/state') { const { account, sessions, ...safeData } = data; return send(res, 200, { ...safeData, profile: profileView(data.profile) }); }
+    if (url.pathname === '/api/profile' && req.method === 'GET') return send(res, 200, profileView(data.profile));
+    if (url.pathname === '/api/profile' && req.method === 'PUT') { const input = await parse(req); delete input.photoStoredName; data.profile = { ...data.profile, ...input }; save(data); return send(res, 200, profileView(data.profile)); }
+    if (url.pathname === '/api/profile/photo' && req.method === 'POST') {
+      const input = await parse(req, 5 * 1024 * 1024); const buffer = Buffer.from(input.data || '', 'base64'); const mime = String(input.mime || '');
+      const png = mime === 'image/png' && buffer.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])); const jpeg = mime === 'image/jpeg' && buffer[0] === 0xff && buffer[1] === 0xd8;
+      if (!buffer.length || buffer.length > 3 * 1024 * 1024 || (!png && !jpeg)) return send(res, 400, { error: 'Upload a PNG or JPEG image smaller than 3 MB.' });
+      if (data.profile.photoStoredName) { const old = path.join(profileDir, data.profile.photoStoredName); if (fs.existsSync(old)) fs.unlinkSync(old); }
+      const storedName = `photo-${crypto.randomUUID()}.${png ? 'png' : 'jpg'}`; fs.writeFileSync(path.join(profileDir, storedName), buffer); data.profile.photoStoredName = storedName; data.profile.photoMime = mime; save(data); return send(res, 201, profileView(data.profile));
+    }
+    if (url.pathname === '/api/profile/photo' && req.method === 'GET') { const name = data.profile.photoStoredName; const file = name && path.join(profileDir, name); if (!file || !file.startsWith(profileDir) || !fs.existsSync(file)) return send(res, 404, { error: 'Profile photo not found.' }); res.writeHead(200, { 'content-type': data.profile.photoMime || 'image/jpeg', 'cache-control': 'private, max-age=300' }); return fs.createReadStream(file).pipe(res); }
     if (url.pathname === '/api/ai/status' && req.method === 'GET') return send(res, 200, { configured: Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY), provider: 'gemini', model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
     if (url.pathname === '/api/ai/assist' && req.method === 'POST') {
       const input = await parse(req);
@@ -191,7 +221,7 @@ async function api(req, res, url) {
       const storedName = `${id}-${filename}`;
       fs.writeFileSync(path.join(resumeDir, storedName), buffer);
       const resume = { id, filename, storedName, mime: input.mime || 'application/octet-stream', size: buffer.length, status: 'parsed', createdAt: new Date().toISOString(), extractedText: text, suggestions: profileSuggestions(text) };
-      data.resumes.unshift(resume); save(data);
+      data.resumes.unshift(resume); if (!data.profile.sourceResumeId) data.profile.sourceResumeId = resume.id; save(data);
       return send(res, 201, { ...resume, extractedText: text.slice(0, 4000) });
     }
     if (parts[1] === 'resumes' && parts[3] === 'apply-suggestions' && req.method === 'POST') {
@@ -217,6 +247,7 @@ async function api(req, res, url) {
         data.applications.push(application);
       }
       const source = data.resumes.find(item => item.id === data.profile.sourceResumeId)?.extractedText || '';
+      if (!source) return send(res, 400, { error: 'Import and select a master resume before approving a job.' });
       const result = await generateResume(data.profile, job, source);
       application.status = 'resume_ready';
       application.resume = { version: `${application.company} — tailored resume`, generatedAt: new Date().toISOString(), ...result };
@@ -228,11 +259,15 @@ async function api(req, res, url) {
       const application = data.applications.find(item => item.id === parts[2]); if (!application) return send(res, 404, { error: 'Application not found' });
       const job = data.jobs.find(item => item.id === application.jobId) || application;
       const source = data.resumes.find(item => item.id === data.profile.sourceResumeId)?.extractedText || '';
+      if (!source) return send(res, 400, { error: 'Import and select a master resume before tailoring.' });
       const result = await generateResume(data.profile, job, source); application.status = 'resume_ready'; application.resume = { version: `${application.company} — tailored resume`, generatedAt: new Date().toISOString(), ...result }; save(data); return send(res, 200, application);
     }
     if (parts[1] === 'applications' && parts[3] === 'download' && req.method === 'GET') {
       const application = data.applications.find(item => item.id === parts[2]); if (!application?.resume?.text) return send(res, 404, { error: 'Tailored resume not ready' });
-      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-disposition': `attachment; filename="${safeName(application.company)}-resume.txt"` }); return res.end(application.resume.text);
+      const format = url.searchParams.get('format') || 'docx'; const base = `${safeName(application.company)}-${safeName(application.title)}-resume`;
+      if (format === 'docx') { const buffer = await atsDocx(application, data.profile); res.writeHead(200, { 'content-type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'content-disposition': `attachment; filename="${base}-ATS.docx"` }); return res.end(buffer); }
+      if (format === 'pdf') { const photo = data.profile.photoStoredName ? path.join(profileDir, data.profile.photoStoredName) : ''; const buffer = await visualPdf(application, data.profile, photo); res.writeHead(200, { 'content-type': 'application/pdf', 'content-disposition': `attachment; filename="${base}-visual.pdf"` }); return res.end(buffer); }
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-disposition': `attachment; filename="${base}.txt"` }); return res.end(application.resume.text);
     }
     if (url.pathname === '/api/integrations' && req.method === 'GET') return send(res, 200, data.integrations);
     if (parts[1] === 'integrations' && parts[3] === 'connect' && req.method === 'POST') { const integration = data.integrations.find(item => item.id === parts[2]); if (!integration) return send(res, 404, { error: 'Integration not found' }); integration.connectedAt = new Date().toISOString(); integration.status = integration.url ? 'browser_handoff' : 'needs_credentials'; save(data); return send(res, 200, integration); }

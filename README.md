@@ -24,6 +24,7 @@ Run the built-in validation with `npm test`.
 - `POST /api/auth/signout`
 - `GET /api/state`
 - `GET|PUT /api/profile`
+- `GET|POST /api/profile/photo`
 - `GET|POST /api/resumes`
 - `POST /api/resumes/:id/apply-suggestions`
 - `GET /api/resumes/:id/download`
@@ -54,3 +55,7 @@ Deployment is connected to Coolify through the repository push webhook. Pushes t
 Resume tailoring uses OpenAI when `OPENAI_API_KEY` is present, Gemini when `GEMINI_API_KEY` is present, and a local template when neither is configured. Set the model names with `OPENAI_MODEL` or `GEMINI_MODEL`. Keep keys in Coolify environment variables; never commit them.
 
 Contextual “Help me write” controls use Gemini for target titles, skill lists, professional summaries, and future application-answer fields. Configure `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Coolify; the secret is only read by the server and is never sent to the browser. Suggestions are grounded in the confirmed profile and must be reviewed before saving.
+
+## Resume outputs
+
+Every tailored application is grounded in the selected master resume's extracted text. Approval is blocked until a master resume is selected. Northstar produces an ATS-oriented `.docx` with standard headings, Arial text, a single-column reading order, and no image, plus a polished `.pdf` that can include the user's PNG/JPEG profile photo. The separate formats are intentional: profile photos can reduce parsing reliability in applicant-tracking systems.

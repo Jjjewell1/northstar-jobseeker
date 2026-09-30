@@ -5,4 +5,5 @@ node_modules/
 !.env.example
 data/store.json
 data/resumes/
+data/profile/
 .docker-config/
