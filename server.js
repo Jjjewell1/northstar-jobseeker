@@ -71,12 +71,36 @@ async function generateResume(profile, job, sourceText = '') {
     const response = await fetch('https://api.openai.com/v1/responses', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-5-mini', input: prompt, store: false }) });
     if (response.ok) { const result = await response.json(); return { text: result.output_text || templateResume(profile, job), provider: 'openai' }; }
   }
-  if (process.env.GEMINI_API_KEY) {
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  if (geminiKey) {
     const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) });
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) });
     if (response.ok) { const result = await response.json(); return { text: result.candidates?.[0]?.content?.parts?.[0]?.text || templateResume(profile, job), provider: 'gemini' }; }
   }
   return { text: templateResume(profile, job), provider: 'template' };
+}
+
+async function assistWithGemini(field, value, profile) {
+  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  if (!key) throw Object.assign(new Error('Gemini is not configured. Add GEMINI_API_KEY in Coolify.'), { status: 503 });
+  const instructions = {
+    title: 'Polish the candidate target job title. Return one concise title only.',
+    skills: 'Improve and organize this comma-separated skills list. Use only skills already present in the supplied profile or text. Return a comma-separated list only.',
+    summary: 'Write a strong, concise professional summary of 60 to 100 words for job applications.',
+    application: 'Improve this job-application response so it is direct, warm, specific, and professional.'
+  };
+  if (!instructions[field]) throw Object.assign(new Error('Unsupported AI writing field.'), { status: 400 });
+  const prompt = `${instructions[field]} Never invent employers, dates, education, credentials, achievements, metrics, or skills. Preserve the candidate's meaning and write in first person when appropriate. Return only the replacement text, with no heading or commentary.\n\nConfirmed profile: ${JSON.stringify(profile)}\n\nCurrent text: ${String(value || '').slice(0, 6000)}`;
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.35, maxOutputTokens: 600 } }) });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw Object.assign(new Error(detail.error?.message || `Gemini returned ${response.status}`), { status: 502 });
+  }
+  const result = await response.json();
+  const text = result.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('').trim();
+  if (!text) throw Object.assign(new Error('Gemini returned an empty suggestion.'), { status: 502 });
+  return text.replace(/^```(?:text)?\s*|\s*```$/g, '').trim();
 }
 async function discover(data) {
   const query = encodeURIComponent(data.profile.title || 'operations');
@@ -100,6 +124,12 @@ async function api(req, res, url) {
     if (url.pathname === '/api/state') return send(res, 200, data);
     if (url.pathname === '/api/profile' && req.method === 'GET') return send(res, 200, data.profile);
     if (url.pathname === '/api/profile' && req.method === 'PUT') { data.profile = { ...data.profile, ...await parse(req) }; save(data); return send(res, 200, data.profile); }
+    if (url.pathname === '/api/ai/status' && req.method === 'GET') return send(res, 200, { configured: Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY), provider: 'gemini', model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
+    if (url.pathname === '/api/ai/assist' && req.method === 'POST') {
+      const input = await parse(req);
+      const text = await assistWithGemini(input.field, input.value, data.profile);
+      return send(res, 200, { text, provider: 'gemini' });
+    }
 
     if (url.pathname === '/api/resumes' && req.method === 'GET') return send(res, 200, data.resumes.map(({ extractedText, ...resume }) => resume));
     if (url.pathname === '/api/resumes' && req.method === 'POST') {
@@ -160,7 +190,7 @@ async function api(req, res, url) {
     if (url.pathname === '/api/runs' && req.method === 'GET') return send(res, 200, data.runs);
     if (url.pathname === '/api/runs' && req.method === 'POST') { const found = await discover(data); const run = { id: crypto.randomUUID(), status: 'completed', found, startedAt: new Date().toISOString() }; data.runs.unshift(run); save(data); return send(res, 201, run); }
     return send(res, 404, { error: 'Not found' });
-  } catch (error) { console.error(error); return send(res, 400, { error: error.message || 'Request failed' }); }
+  } catch (error) { console.error(error); return send(res, error.status || 400, { error: error.message || 'Request failed' }); }
 }
 
 async function scheduledRun() {

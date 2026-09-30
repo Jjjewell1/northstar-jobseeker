@@ -46,3 +46,5 @@ Deployment is connected to Coolify through the repository push webhook. Pushes t
 ## AI providers
 
 Resume tailoring uses OpenAI when `OPENAI_API_KEY` is present, Gemini when `GEMINI_API_KEY` is present, and a local template when neither is configured. Set the model names with `OPENAI_MODEL` or `GEMINI_MODEL`. Keep keys in Coolify environment variables; never commit them.
+
+Contextual “Help me write” controls use Gemini for target titles, skill lists, professional summaries, and future application-answer fields. Configure `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Coolify; the secret is only read by the server and is never sent to the browser. Suggestions are grounded in the confirmed profile and must be reviewed before saving.
