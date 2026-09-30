@@ -1,6 +1,8 @@
 node_modules/
+.npm-cache/
 .env
 .env.*
 !.env.example
 data/store.json
+data/resumes/
 .docker-config/
