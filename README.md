@@ -2,7 +2,7 @@
 
 Northstar is an approval-first job-search assistant. It discovers current remote roles, imports PDF/DOCX/text resumes, extracts profile details, generates a truthful job-specific resume, and keeps every application behind an explicit approval step. It includes persistent local storage, twice-daily searches, manual runs, dark mode, onboarding, and a Docker image suitable for Coolify.
 
-The deployed single-user MVP includes real account creation, password-based sign-in, 30-day secure HTTP-only sessions, sign-out, session-protected APIs, and a guided three-step setup checklist. Passwords are stored as salted `scrypt` hashes, never as plain text.
+The deployed single-user MVP includes real account creation, password-based sign-in, 30-day secure HTTP-only sessions, sign-out, session-protected APIs, and a guided three-step setup checklist. Onboarding starts with master-resume import, uses extracted resume details to seed the profile, and only then unlocks AI-assisted profile writing. Passwords are stored as salted `scrypt` hashes, never as plain text.
 
 ## Run locally
 
@@ -52,9 +52,9 @@ Deployment is connected to Coolify through the repository push webhook. Pushes t
 
 ## AI providers
 
-Resume tailoring uses OpenAI when `OPENAI_API_KEY` is present, Gemini when `GEMINI_API_KEY` is present, and a local template when neither is configured. Set the model names with `OPENAI_MODEL` or `GEMINI_MODEL`. Keep keys in Coolify environment variables; never commit them.
+Resume tailoring uses OpenAI when `OPENAI_API_KEY` is present, Gemini when `GEMINI_API_KEY` is present, and a local template when neither is configured. Gemini defaults to stable `gemini-3.8-flash`, using low reasoning for interactive field help and high reasoning for full resumes. Override with `GEMINI_ASSIST_MODEL` and `GEMINI_RESUME_MODEL`, or set both with `GEMINI_MODEL`. Keep keys in Coolify environment variables; never commit them.
 
-Contextual “Help me write” controls use Gemini for target titles, skill lists, professional summaries, and future application-answer fields. Configure `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Coolify; the secret is only read by the server and is never sent to the browser. Suggestions are grounded in the confirmed profile and must be reviewed before saving.
+Contextual “Help me write” controls use Gemini for target titles, skill lists, professional summaries, and future application-answer fields. Configure `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Coolify; the secret is only read by the server and is never sent to the browser. Every suggestion includes the selected master resume as source context and is unavailable until that resume has been imported. Suggestions must be reviewed before saving.
 
 ## Resume outputs
 

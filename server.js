@@ -109,8 +109,8 @@ async function generateResume(profile, job, sourceText = '') {
   }
   const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (geminiKey) {
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) });
+    const model = process.env.GEMINI_RESUME_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingLevel: 'high' } } }) });
     if (response.ok) { const result = await response.json(); return { text: result.candidates?.[0]?.content?.parts?.[0]?.text || templateResume(profile, job, sourceText), provider: 'gemini' }; }
   }
   return { text: templateResume(profile, job, sourceText), provider: 'template' };
@@ -133,9 +133,10 @@ async function atsDocx(application, profile) {
 }
 function visualPdf(application, profile, photoPath = '') { return new Promise((resolve, reject) => { const doc = new PDFDocument({ size: 'LETTER', margins: { top: 54, left: 54, right: 54, bottom: 54 }, info: { Title: `${profile.name} Resume`, Author: profile.name } }); const chunks = []; doc.on('data', chunk => chunks.push(chunk)); doc.on('end', () => resolve(Buffer.concat(chunks))); doc.on('error', reject); doc.rect(0, 0, 612, 116).fill('#173D33'); doc.fillColor('#FFFFFF').font('Helvetica-Bold').fontSize(24).text(profile.name || '', 54, 40, { width: photoPath ? 410 : 504 }); doc.font('Helvetica').fontSize(11).fillColor('#D8F06B').text(profile.title || application.title, 54, 74); doc.fontSize(9).fillColor('#EAF3ED').text([profile.location, profile.email, profile.phone].filter(Boolean).join('  •  '), 54, 94); if (photoPath && fs.existsSync(photoPath)) { try { doc.save().circle(548, 58, 36).clip().image(photoPath, 512, 22, { fit: [72, 72], align: 'center', valign: 'center' }).restore(); } catch {} } doc.y = 142; for (const section of resumeSections(application.resume.text)) { if (!section.title || section.title === 'TARGET ROLE' || section.title === 'APPLICATION NOTES') continue; if (doc.y > 680) doc.addPage(); doc.fillColor('#1D5F4A').font('Helvetica-Bold').fontSize(11).text(section.title, { characterSpacing: .7 }); doc.moveDown(.25); doc.fillColor('#26332E').font('Helvetica').fontSize(9.5); for (const line of section.lines) doc.text(line, { lineGap: 2 }); doc.moveDown(.7); } doc.end(); }); }
 
-async function assistWithGemini(field, value, profile) {
+async function assistWithGemini(field, value, profile, sourceText = '') {
   const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!key) throw Object.assign(new Error('Gemini is not configured. Add GEMINI_API_KEY in Coolify.'), { status: 503 });
+  if (!sourceText) throw Object.assign(new Error('Upload and select your master resume before using AI writing help.'), { status: 400 });
   const instructions = {
     title: 'Polish the candidate target job title. Return one concise title only.',
     skills: 'Improve and organize this comma-separated skills list. Use only skills already present in the supplied profile or text. Return a comma-separated list only.',
@@ -143,9 +144,9 @@ async function assistWithGemini(field, value, profile) {
     application: 'Improve this job-application response so it is direct, warm, specific, and professional.'
   };
   if (!instructions[field]) throw Object.assign(new Error('Unsupported AI writing field.'), { status: 400 });
-  const prompt = `${instructions[field]} Never invent employers, dates, education, credentials, achievements, metrics, or skills. Preserve the candidate's meaning and write in first person when appropriate. Return only the replacement text, with no heading or commentary.\n\nConfirmed profile: ${JSON.stringify(profile)}\n\nCurrent text: ${String(value || '').slice(0, 6000)}`;
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.35, maxOutputTokens: 600 } }) });
+  const prompt = `${instructions[field]} Treat the master resume below as the factual source of truth. Never invent employers, dates, education, credentials, achievements, metrics, or skills. Preserve the candidate's meaning and write in first person when appropriate. Return only the replacement text, with no heading or commentary.\n\nMASTER RESUME:\n${sourceText.slice(0, 18000)}\n\nConfirmed profile: ${JSON.stringify(profile)}\n\nCurrent text: ${String(value || '').slice(0, 6000)}`;
+  const model = process.env.GEMINI_ASSIST_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { thinkingConfig: { thinkingLevel: 'low' }, maxOutputTokens: 1000 } }) });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));
     throw Object.assign(new Error(detail.error?.message || `Gemini returned ${response.status}`), { status: 502 });
@@ -203,10 +204,11 @@ async function api(req, res, url) {
       const storedName = `photo-${crypto.randomUUID()}.${png ? 'png' : 'jpg'}`; fs.writeFileSync(path.join(profileDir, storedName), buffer); data.profile.photoStoredName = storedName; data.profile.photoMime = mime; save(data); return send(res, 201, profileView(data.profile));
     }
     if (url.pathname === '/api/profile/photo' && req.method === 'GET') { const name = data.profile.photoStoredName; const file = name && path.join(profileDir, name); if (!file || !file.startsWith(profileDir) || !fs.existsSync(file)) return send(res, 404, { error: 'Profile photo not found.' }); res.writeHead(200, { 'content-type': data.profile.photoMime || 'image/jpeg', 'cache-control': 'private, max-age=300' }); return fs.createReadStream(file).pipe(res); }
-    if (url.pathname === '/api/ai/status' && req.method === 'GET') return send(res, 200, { configured: Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY), provider: 'gemini', model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
+    if (url.pathname === '/api/ai/status' && req.method === 'GET') return send(res, 200, { configured: Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY), provider: 'gemini', assistModel: process.env.GEMINI_ASSIST_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash', resumeModel: process.env.GEMINI_RESUME_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash' });
     if (url.pathname === '/api/ai/assist' && req.method === 'POST') {
       const input = await parse(req);
-      const text = await assistWithGemini(input.field, input.value, data.profile);
+      const sourceText = data.resumes.find(item => item.id === data.profile.sourceResumeId)?.extractedText || '';
+      const text = await assistWithGemini(input.field, input.value, data.profile, sourceText);
       return send(res, 200, { text, provider: 'gemini' });
     }
 
