@@ -19,6 +19,7 @@ fs.mkdirSync(profileDir, { recursive: true });
 const seed = {
   account: null,
   sessions: [],
+  applicationProfile: { workAuthorized: '', needsSponsorship: '', desiredSalary: '', willingToRelocate: '', willingToTravel: '', linkedIn: '', portfolio: '' },
   profile: { name: '', title: '', email: '', phone: '', location: '', skills: [], summary: '', links: [] },
   resumes: [],
   jobs: [],
@@ -36,10 +37,18 @@ function read() {
   const data = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
   data.resumes ||= [];
   data.sessions ||= [];
+  data.applicationProfile = { ...seed.applicationProfile, ...(data.applicationProfile || {}) };
   data.profile ||= structuredClone(seed.profile);
   data.profile.links ||= [];
   data.profile.skills ||= [];
   data.jobs = (data.jobs || []).filter(job => job.source || ![1, 2, 3].includes(job.id));
+  data.applications ||= [];
+  for (const application of data.applications) {
+    const job = data.jobs.find(item => item.id === application.jobId);
+    application.url ||= job?.url || '';
+    application.source ||= job?.source || '';
+    if (application.status === 'resume_ready' && !application.worker) application.worker = { status: 'queued', queuedAt: new Date().toISOString(), attempts: 0, events: [{ type: 'queued', at: new Date().toISOString(), message: 'Application queued for preparation.' }] };
+  }
   return data;
 }
 const save = data => fs.writeFileSync(dataFile, JSON.stringify(data, null, 2));
@@ -170,6 +179,43 @@ async function discover(data) {
   return data.jobs.filter(job => job.status === 'review').length;
 }
 
+function providerFor(url = '') {
+  let host = ''; try { host = new URL(url).hostname.toLowerCase(); } catch {}
+  if (host.includes('greenhouse.io')) return 'greenhouse';
+  if (host.includes('lever.co')) return 'lever';
+  if (host.includes('myworkdayjobs.com') || host.includes('workday.com')) return 'workday';
+  if (host.includes('linkedin.com')) return 'linkedin';
+  if (host.includes('indeed.com')) return 'indeed';
+  return 'external';
+}
+function workerRequirements(data) {
+  const fields = [
+    ['name', data.profile.name, 'Full name'], ['email', data.profile.email, 'Email'], ['phone', data.profile.phone, 'Phone'], ['location', data.profile.location, 'Location'],
+    ['workAuthorized', data.applicationProfile.workAuthorized, 'Work authorization'], ['needsSponsorship', data.applicationProfile.needsSponsorship, 'Sponsorship requirement']
+  ];
+  return fields.filter(([, value]) => value === '' || value === null || value === undefined).map(([key,, label]) => ({ key, label }));
+}
+function prepareWorker(data, application) {
+  const provider = providerFor(application.url); const missing = workerRequirements(data); const now = new Date().toISOString();
+  application.worker ||= { status: 'queued', queuedAt: now, attempts: 0, events: [] };
+  application.worker.attempts = (application.worker.attempts || 0) + 1;
+  application.worker.provider = provider;
+  application.worker.mode = ['greenhouse', 'lever', 'workday', 'linkedin', 'indeed'].includes(provider) ? 'supervised_handoff' : 'manual_handoff';
+  application.worker.applyUrl = application.url || '';
+  application.worker.missing = missing;
+  application.worker.preparedFields = {
+    name: data.profile.name || '', email: data.profile.email || '', phone: data.profile.phone || '', location: data.profile.location || '',
+    workAuthorized: data.applicationProfile.workAuthorized || '', needsSponsorship: data.applicationProfile.needsSponsorship || '', desiredSalary: data.applicationProfile.desiredSalary || '',
+    linkedIn: data.applicationProfile.linkedIn || '', portfolio: data.applicationProfile.portfolio || ''
+  };
+  application.worker.resumeUrl = `/api/applications/${application.id}/download?format=docx`;
+  application.worker.status = missing.length ? 'needs_review' : 'ready_to_open';
+  application.worker.preparedAt = now;
+  application.worker.events ||= [];
+  application.worker.events.push({ type: application.worker.status, at: now, message: missing.length ? `${missing.length} required answer(s) need review.` : `Application package prepared for ${provider}.` });
+  application.status = application.worker.status;
+}
+
 async function api(req, res, url) {
   const data = read();
   const parts = url.pathname.split('/').filter(Boolean);
@@ -196,6 +242,8 @@ async function api(req, res, url) {
     if (url.pathname === '/api/state') { const { account, sessions, ...safeData } = data; return send(res, 200, { ...safeData, profile: profileView(data.profile) }); }
     if (url.pathname === '/api/profile' && req.method === 'GET') return send(res, 200, profileView(data.profile));
     if (url.pathname === '/api/profile' && req.method === 'PUT') { const input = await parse(req); delete input.photoStoredName; data.profile = { ...data.profile, ...input }; save(data); return send(res, 200, profileView(data.profile)); }
+    if (url.pathname === '/api/application-profile' && req.method === 'GET') return send(res, 200, data.applicationProfile);
+    if (url.pathname === '/api/application-profile' && req.method === 'PUT') { const input = await parse(req); const allowed = Object.keys(seed.applicationProfile); data.applicationProfile = { ...data.applicationProfile, ...Object.fromEntries(Object.entries(input).filter(([key]) => allowed.includes(key))) }; save(data); return send(res, 200, data.applicationProfile); }
     if (url.pathname === '/api/profile/photo' && req.method === 'POST') {
       const input = await parse(req, 5 * 1024 * 1024); const buffer = Buffer.from(input.data || '', 'base64'); const mime = String(input.mime || '');
       const png = mime === 'image/png' && buffer.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])); const jpeg = mime === 'image/jpeg' && buffer[0] === 0xff && buffer[1] === 0xd8;
@@ -245,24 +293,28 @@ async function api(req, res, url) {
       const job = data.jobs.find(item => String(item.id) === parts[2]); if (!job) return send(res, 404, { error: 'Job not found' });
       let application = data.applications.find(item => item.id === job.applicationId);
       if (!application) {
-        application = { id: crypto.randomUUID(), jobId: job.id, company: job.company, title: job.title, status: 'resume_draft', createdAt: new Date().toISOString() };
+        application = { id: crypto.randomUUID(), jobId: job.id, company: job.company, title: job.title, url: job.url || '', source: job.source || '', status: 'resume_draft', createdAt: new Date().toISOString() };
         data.applications.push(application);
       }
       const source = data.resumes.find(item => item.id === data.profile.sourceResumeId)?.extractedText || '';
       if (!source) return send(res, 400, { error: 'Import and select a master resume before approving a job.' });
       const result = await generateResume(data.profile, job, source);
-      application.status = 'resume_ready';
+      application.status = 'queued';
       application.resume = { version: `${application.company} — tailored resume`, generatedAt: new Date().toISOString(), ...result };
+      application.worker = { status: 'queued', queuedAt: new Date().toISOString(), attempts: 0, events: [{ type: 'queued', at: new Date().toISOString(), message: 'Approved application queued for preparation.' }] };
       job.status = 'approved'; job.applicationId = application.id; save(data); return send(res, 200, { job, application });
     }
     if (parts[1] === 'jobs' && parts[3] === 'dismiss' && req.method === 'POST') { const job = data.jobs.find(item => String(item.id) === parts[2]); if (!job) return send(res, 404, { error: 'Job not found' }); job.status = 'dismissed'; save(data); return send(res, 200, job); }
     if (url.pathname === '/api/applications') return send(res, 200, data.applications);
+    if (parts[1] === 'applications' && parts.length === 3 && req.method === 'GET') { const application = data.applications.find(item => item.id === parts[2]); return application ? send(res, 200, application) : send(res, 404, { error: 'Application not found' }); }
+    if (parts[1] === 'applications' && parts[3] === 'prepare' && req.method === 'POST') { const application = data.applications.find(item => item.id === parts[2]); if (!application) return send(res, 404, { error: 'Application not found' }); application.worker ||= { events: [], attempts: 0 }; application.worker.status = 'queued'; application.worker.queuedAt = new Date().toISOString(); application.worker.events ||= []; application.worker.events.push({ type: 'queued', at: application.worker.queuedAt, message: 'Application requeued by user.' }); application.status = 'queued'; save(data); return send(res, 202, application); }
+    if (parts[1] === 'applications' && parts[3] === 'mark-submitted' && req.method === 'POST') { const application = data.applications.find(item => item.id === parts[2]); if (!application) return send(res, 404, { error: 'Application not found' }); if (!['ready_to_open', 'awaiting_submission'].includes(application.worker?.status)) return send(res, 409, { error: 'Prepare and review the application before marking it submitted.' }); const now = new Date().toISOString(); application.worker.status = 'submitted'; application.worker.submittedAt = now; application.worker.events.push({ type: 'submitted', at: now, message: 'User confirmed submission on the employer site.' }); application.status = 'submitted'; save(data); return send(res, 200, application); }
     if (parts[1] === 'applications' && parts[3] === 'tailor' && req.method === 'POST') {
       const application = data.applications.find(item => item.id === parts[2]); if (!application) return send(res, 404, { error: 'Application not found' });
       const job = data.jobs.find(item => item.id === application.jobId) || application;
       const source = data.resumes.find(item => item.id === data.profile.sourceResumeId)?.extractedText || '';
       if (!source) return send(res, 400, { error: 'Import and select a master resume before tailoring.' });
-      const result = await generateResume(data.profile, job, source); application.status = 'resume_ready'; application.resume = { version: `${application.company} — tailored resume`, generatedAt: new Date().toISOString(), ...result }; save(data); return send(res, 200, application);
+      const result = await generateResume(data.profile, job, source); application.status = 'queued'; application.resume = { version: `${application.company} — tailored resume`, generatedAt: new Date().toISOString(), ...result }; application.worker = { status: 'queued', queuedAt: new Date().toISOString(), attempts: 0, events: [{ type: 'queued', at: new Date().toISOString(), message: 'Application queued after resume tailoring.' }] }; save(data); return send(res, 200, application);
     }
     if (parts[1] === 'applications' && parts[3] === 'download' && req.method === 'GET') {
       const application = data.applications.find(item => item.id === parts[2]); if (!application?.resume?.text) return send(res, 404, { error: 'Tailored resume not ready' });
@@ -284,7 +336,13 @@ async function scheduledRun() {
   const key = `${now.toISOString().slice(0, 10)}-${hour}`; if (data.runs.some(run => run.scheduleKey === key)) return;
   const found = await discover(data); data.runs.unshift({ id: crypto.randomUUID(), status: 'completed', trigger: 'schedule', scheduleKey: key, found, startedAt: now.toISOString() }); save(data);
 }
-setInterval(scheduledRun, 60000); scheduledRun();
+function workerTick() {
+  const data = read(); const application = data.applications.find(item => item.worker?.status === 'queued'); if (!application) return;
+  application.worker.status = 'preparing'; application.worker.startedAt = new Date().toISOString(); application.status = 'preparing';
+  try { prepareWorker(data, application); } catch (error) { application.worker.status = 'failed'; application.worker.error = 'Preparation failed. Retry from Northstar.'; application.worker.events ||= []; application.worker.events.push({ type: 'failed', at: new Date().toISOString(), message: error.message }); application.status = 'failed'; }
+  save(data);
+}
+setInterval(scheduledRun, 60000); scheduledRun(); setInterval(workerTick, 3000); workerTick();
 
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
 http.createServer((req, res) => {
